@@ -1,0 +1,273 @@
+/*************************************************************
+SELF-PAY PLACEMENTS DATAMARTS
+
+Creates these datamarts:
+    * SP_DW.SP_PLACEMENTS_DETAIL
+    * SP_DW.SP_KPI_PLACEMENTS_NEW
+
+Updated 2021-04-21 10:53
+*************************************************************/
+%include 'F:\ASG\SAS\libs_servers_options.sas';
+
+%let db = SP_DW;
+/*%let db = WORK;*/
+/*************************************************************
+*************************************************************/
+data _null_;
+    offset = 24;
+    date_min = intnx('month',today(),-1*offset,'b');
+    date_max = intnx('month',today(),-1,'e');
+    call symput('cache_date_min',put(date_min,yymmdd10.));
+    call symput('cache_date_max',put(date_max,yymmdd10.));
+    call symput('sas_date_max',put(date_max,date9.));
+run;
+
+proc format;
+    value score
+        800-999 = '800-999'
+        600-799 = '600-799'
+        400-599 = '400-599'
+        200-399 = '200-399'
+        000-199 = '0-199'
+        other = 'Not Scored'
+;
+run;
+
+proc sql noprint;
+    select distinct
+        "'"||strip(hcfaid)||"'"
+        into :sp_clients
+        separated by ','
+    from
+        SP_DW.sp_kpi_clients
+;
+
+
+/*************************************************************
+*************************************************************/
+PROC SQL ;
+    CONNECT TO ODBC AS Db (dsn="HCT Shadow");
+    CREATE TABLE WORK.sp_plac0 AS
+    SELECT * FROM CONNECTION TO Db
+    (
+    select
+        hcfapasid
+        , hcfaid
+        , zzfaoffice
+        , zzfaclientalias
+
+        , hcenid
+        , zzenpttype
+        , hcenfinclass
+
+        , hcenguarid
+        , hcenptacct
+        , hcenadmdte
+        , hcendscdte
+        , hcenlstwrkdte
+        , hcenorglddte
+        , hcenorigbal
+        , zzenloadbalance
+        , zzencdte
+        , zzencbal
+
+        , hcacbal
+        , hcaccode
+        , zzaccustscore
+        , zzaccustyield
+        , zzaclinkscore 
+        , cast(zzacivnchscore as varchar(1)) as zzacivnchscore
+
+        , hcpypygid 
+    from        
+        hcencounter 
+        inner join hcfacility on hcenfacility = hcfaid
+        inner join hcaccount on hcenid = hcacencntrid
+        left join hcpayer on hcacpayerid = hcpyid
+    where
+        hcenorglddte between "&cache_date_min" and "&cache_date_max"
+        and hcfaid in (&sp_clients)
+);
+DISCONNECT FROM Db;
+QUIT;
+
+
+/*************************************************************
+*************************************************************/
+%let tbl = WORK.sp_plac0;
+%include 'F:\Self-Pay\Self-Pay labels and groupings.sas';
+
+/*************************************************************
+*************************************************************/
+data WORK.sp_plac1(rename=(hcenid=Encounter_ID hcenguarid=Guarantor_ID zzaccustscore=Propensity_Score zzaccustyield=Yield_Score 
+            zzacivnchscore=iVinci_Score zzencdte=Close_Date zzencbal=Close_Balance hcenlstwrkdte=Last_Worked_Date 
+            hcenorglddte=Placement_Date hcpypygid=Payer_Group hcenptacct=Patient_ID 
+            hcaccode=Status_Code)
+        drop=hcfapasid hcfaid zzfaoffice zzfaclientalias zzenpttype hcenfinclass hcendscdte hcenadmdte zzaclinkscore
+            zzenloadbalance hcenorigbal hcacbal);
+    length eScore $10 Open_Status $6;
+    format hcenorglddte Service_Date yymmdd10. Placement_Month yymmd7.;
+    set WORK.sp_plac0;
+
+    Placement_Month = intnx('month',hcenorglddte,0,'b');
+    eScore = put(zzaclinkscore,score.);
+
+    if coalesce(hcendscdte,hcenadmdte) gt hcenorglddte then Service_Date = .;
+        else Service_Date = coalesce(hcendscdte,hcenadmdte); 
+    if missing(Service_Date) then do;
+        Age_at_Placement = .;
+        Aging_since_Service = .;
+    end;
+    else do;
+        Age_at_Placement = intck('day',Service_Date,hcenorglddte);
+        Aging_since_Service = intck('day',Service_Date,today());
+    end;
+    Aging_since_Placement = intck('day',hcenorglddte,today());
+
+    Placement_Balance_d = coalesce(zzenloadbalance,hcenorigbal);
+
+    if hcaccode = 'CLOSED' and zzencdte le "&sas_date_max"d then Current_Balance_d = 0;
+        else Current_Balance_d = hcacbal;
+
+    if Current_Balance_d gt 0 then Open_Status = 'Open';
+        else Open_Status = 'Closed';
+
+run;
+
+/*************************************************************
+*************************************************************/
+proc sql;
+    create table WORK.mtbd0 as
+    select
+        d.Encounter_ID
+        , Action_Date
+        , Close_Balance
+        , Bad_Debt 
+    from            
+        WORK.sp_plac1 as p 
+        inner join &db..sp_dispositions_detail as d on d.encounter_id=p.encounter_id
+    where           
+        not missing(Close_Date)
+        and Close_Date le "&sas_date_max"d
+        and intck('day',Placement_Date,Close_Date) ge 120
+        and Close_Balance gt 0
+;
+quit;
+
+proc sql;
+    create table WORK.mtbd1 as
+    select 
+        t1.*
+    from 
+        WORK.mtbd0 as t1
+        inner join (
+            select 
+                Encounter_ID
+                , max(Action_Date) format=date9. as maxdate
+            from 
+                WORK.mtbd0
+            where 
+                Bad_Debt = 1
+            group by 
+                Encounter_ID
+            ) as t2 on t1.Action_Date = t2.maxdate and t1.Encounter_ID = t2.Encounter_ID
+;
+quit;
+
+data WORK.mtbd2;
+    set WORK.mtbd1;
+    if Bad_Debt eq 1 then Bad_Debt_d = Close_Balance; 
+        else delete;
+run;
+
+proc sql;
+    create table WORK.mtbd3 as
+    select distinct
+        Encounter_ID
+        , Bad_Debt_d
+    from
+        WORK.mtbd2
+;
+
+proc sql;
+    create table WORK.sp_plac2 as
+    select
+        p.*
+        , coalesce(Bad_Debt_d,0) as Bad_Debt_d
+    from
+        WORK.sp_plac1 as p
+        left join WORK.mtbd3 as b on p.Encounter_ID=b.Encounter_ID
+    order by
+        p.Encounter_ID
+;
+
+
+/*************************************************************
+*************************************************************/
+proc sql;
+    create table WORK.sp_coll1 as
+    select
+        Encounter_ID
+        , sum(Payments_d) as Collections_d
+        , sum(Ins_Payments_d) as Ins_Payments_d
+        , sum(Adjustments_d) as Adjustments_d
+    from
+        &db..sp_transactions_detail
+    group by
+        1
+    order by
+        1
+;
+quit;
+
+data &db..sp_placements_detail;
+    retain Client_ID Sub_Client_ID Patient_Type Financial_Class Office Placement_Month Placement_Date;
+    merge WORK.sp_plac2 (in=p) WORK.sp_coll1 (in=c);
+    by Encounter_ID; 
+    if p;
+    if not c then do; 
+        Collections_d = 0;
+        Ins_Payments_d = 0;
+        Adjustments_d = 0;
+    end;
+    Recalls_d = Placement_Balance_d - (Adjustments_d + Collections_d + Current_Balance_d + Ins_Payments_d);
+    Net_Placements_d = Placement_Balance_d - (Adjustments_d + Recalls_d);
+run;
+
+
+/*************************************************************
+Totals
+*************************************************************/
+PROC SQL;
+    CREATE TABLE &db..sp_kpi_placements_new AS
+    select 
+        Client_ID
+        , Sub_Client_ID
+        , Patient_Type
+        , Financial_Class length=10
+        , Office
+        , Placement_Month
+        , count(Encounter_ID) as Placements_n
+        , count(distinct Guarantor_ID) as Guarantors_n
+        , sum(Placement_Balance_d) format=dollar16.2 as Gross_Placements_d
+        , sum(Recalls_d) format=dollar16.2 as Recalls_d
+        , sum(Adjustments_d) format=dollar16.2 as Adjustments_d
+        , sum(Net_Placements_d) format=dollar16.2 as Net_Placements_d
+        , sum(Collections_d) format=dollar16.2 as Collections_d
+        , sum(Bad_Debt_d) format=dollar16.2 as Bad_Debt_d
+        , sum(Current_Balance_d) format=dollar16.2 as Current_Placements_d
+        , (sum(Collections_d)) / (sum(Placement_Balance_d)) format=percent8. as Gross_Liquidity_r
+        , (sum(Collections_d)) / (sum(Net_Placements_d)) format=percent8. as Net_Liquidity_r
+        , sum(Age_at_Placement) as Age_s
+        , avg(Age_at_Placement) format=8. as Age_m
+    from        
+        &db..sp_placements_detail 
+    group by
+        Client_ID
+        , Sub_Client_ID
+        , Patient_Type
+        , Financial_Class
+        , Office
+        , Placement_Month
+;
+QUIT;
